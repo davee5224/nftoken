@@ -22,7 +22,7 @@ from telegram.ext import (
 from urllib3.exceptions import InsecureRequestWarning
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-BOT_TOKEN      = os.environ.get("BOT_TOKEN", "9221013683:AAGKJGFCsHU6WQhQYgznjNWxxb6u1AvR46Y")
+BOT_TOKEN      = os.environ["BOT_TOKEN"]
 MAX_CONCURRENT = 10
 MAX_COOKIES    = 5000
 
